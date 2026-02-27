@@ -271,19 +271,20 @@ def build_viewer(
 
 
 if __name__ == "__main__":
-    # input_dir = "/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/Visium_HD_Human_Colon_Cancer_P2/maskann_size-512"
-    # rgb_png_path = f"{input_dir}/pca_rgb_no/r0_c256_rgb.png"
-    # he_path = f"{input_dir}/HE/r0_c256_he.png"
-    # pca_path = f"{input_dir}/pca50/r0_c256_pca.npy"
-    # mask_path = f"{input_dir}/sam2_masks/r0_c256_rgb_mask.npy"
-    # mask_label = f"{input_dir}/sam2_masks/r0_c256_rgb_mask_info.csv"
+    input_dir = "/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/Visium_HD_Human_Kidney_FFPE/maskann_size-512"
+    coord = (0, 512)
+    rgb_png_path = f"{input_dir}/pca_rgb_no/r{coord[0]}_c{coord[1]}_rgb.png"
+    he_path = f"{input_dir}/HE/r{coord[0]}_c{coord[1]}_he.png"
+    pca_path = f"{input_dir}/pca50/r{coord[0]}_c{coord[1]}_pca.npy"
+    mask_path = f"{input_dir}/sam2_merged_masks/r{coord[0]}_c{coord[1]}_merged_mask.npy"
+    mask_label = f"{input_dir}/sam2_merged_masks/r{coord[0]}_c{coord[1]}_merged_mask_info.csv"
 
-    input_dir = "/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/Visium_HD_Human_Colon_Cancer_P2/maskann_size-512"
-    rgb_png_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_rgb.png"
-    he_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304.png"
-    pca_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304.npy"
-    mask_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_mask.npy"
-    mask_label = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_inst_info.csv"
+    # input_dir = "/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/Visium_HD_Human_Colon_Cancer_P2/maskann_size-512"
+    # rgb_png_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_rgb.png"
+    # he_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304.png"
+    # pca_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304.npy"
+    # mask_path = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_mask.npy"
+    # mask_label = f"/Users/xiaohanzhao/Projects/Dinov3_ST/napari/data/demo_data/r896_c2304_inst_info.csv"
 
     edited_mask_path = mask_path.replace(".npy", "_edited.npy")
     if not os.path.exists(edited_mask_path):    
