@@ -8,17 +8,23 @@ napari viewer 构建器。
   3. UI：单一 Qt 面板，QGroupBox 分组，深色主题样式
 """
 
+import base64
+import io
 import os
 from typing import Optional
 
+import matplotlib.cm as mpl_cm
 import numpy as np
 import pandas as pd
+import requests
 import napari
 from napari.utils.colormaps import AVAILABLE_COLORMAPS
 from magicgui import magicgui
+from PIL import Image as PILImage
+from qtpy.QtCore import QThread, Signal
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox,
-    QPushButton, QLabel,
+    QPushButton, QLabel, QLineEdit, QComboBox,
 )
 
 from io_utils import (
@@ -27,6 +33,44 @@ from io_utils import (
 )
 from mask_utils import rebuild_instance_table_from_labels, merge_instance_table
 from similarity import world_to_emb_rc, compute_similarity
+
+
+# ── SAM2 worker thread ────────────────────────────────────────────────────────
+
+class _SAM2Worker(QThread):
+    """Sends image + box prompts to the SAM2 server in a background thread."""
+    finished = Signal(list)   # list of np.ndarray bool H×W masks
+    error    = Signal(str)
+
+    def __init__(self, url: str, image_arr: np.ndarray, boxes: list):
+        super().__init__()
+        self._url       = url.rstrip("/") + "/segment"
+        self._image_arr = image_arr   # H×W×3 uint8
+        self._boxes     = boxes       # [[x1,y1,x2,y2], ...]
+
+    def run(self):
+        try:
+            # Encode image as PNG bytes → base64 string
+            pil_img   = PILImage.fromarray(self._image_arr)
+            buf       = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            img_b64   = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            payload = {"image_b64": img_b64, "boxes": self._boxes}
+            resp    = requests.post(self._url, json=payload, timeout=120)
+            resp.raise_for_status()
+            data    = resp.json()
+
+            H, W    = data["shape"]
+            masks   = []
+            for m_b64 in data["masks"]:
+                raw  = base64.b64decode(m_b64)
+                arr  = np.frombuffer(raw, dtype=np.uint8).reshape(H, W).astype(bool)
+                masks.append(arr)
+
+            self.finished.emit(masks)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 
 # ── Qt 样式表 ─────────────────────────────────────────────────────────────────
@@ -83,6 +127,17 @@ QPushButton#saveBtn:hover { background-color: #3a5a3a; }
 
 QLabel#statusLabel  { color: #888888; font-size: 11px; padding: 2px 4px; }
 QLabel#mergeLabel   { color: #66aaff; font-size: 11px; padding: 2px 4px; font-style: italic; }
+
+QPushButton#sam2RunBtn  { background-color: #1a4a1a; color: #aaffaa; border-color: #3a8a3a; font-weight: bold; }
+QPushButton#sam2RunBtn:hover { background-color: #2a6a2a; }
+QPushButton#sam2RunBtn:disabled { background-color: #282828; color: #555; border-color: #383838; }
+QPushButton#sam2DrawBtn { color: #ffdd44; border-color: #7a6a1a; }
+QPushButton#sam2DrawBtn:hover { background-color: #3a3010; }
+QPushButton#sam2DrawActiveBtn { background-color: #3a3010; color: #ffee66; border-color: #aa9922; }
+QLabel#sam2StatusLabel { color: #888888; font-size: 11px; padding: 2px 4px; font-style: italic; }
+QComboBox { background-color: #3c3f41; color: #cccccc; border: 1px solid #555555; border-radius: 4px; padding: 3px 6px; }
+QComboBox::drop-down { border: none; }
+QLineEdit { background-color: #3c3f41; color: #cccccc; border: 1px solid #555555; border-radius: 4px; padding: 3px 6px; font-size: 11px; }
 """
 
 # 每个 merge 候选 instance 的高亮颜色（循环使用）
@@ -119,6 +174,12 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         name="MergeOverlay", rgb=True, opacity=0.72, visible=False,
     )
 
+    # SAM2 box prompts layer
+    sam_boxes = v.add_shapes(
+        [], shape_type="rectangle", name="SAMBoxes",
+        edge_color="yellow", face_color="transparent", edge_width=2,
+    )
+
     # Query 标记
     query_circle = v.add_points(np.zeros((0, 2), dtype=np.float32), name="QueryCircle", size=80)
     try:    query_circle.face_color = "transparent"
@@ -144,6 +205,9 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         "edited_mask_path": None, "edited_csv_path": None, "raw_csv_path": None,
         # merge
         "merge_active": False, "merge_candidates": set(),
+        # sam2
+        "sam2_drawing": False,
+        "sam2_worker": None,    # holds reference to running QThread to prevent GC
     }
 
     params = {
@@ -214,6 +278,77 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         ]
         if params["auto_show_sim"]:
             sim.visible = True
+
+    # ── SAM2 helpers ─────────────────────────────────────────────────────────
+
+    def _get_layer_image_and_scale(layer_name: str):
+        """Return (H×W×3 uint8 image, sy, sx) for the named layer."""
+        if layer_name == "HE":
+            img = he.data
+            if img.dtype != np.uint8:
+                img = (np.clip(img, 0, 255)).astype(np.uint8)
+            return img, 1.0, 1.0
+        elif layer_name == "ST_RGB":
+            img = st.data
+            if img.dtype != np.uint8:
+                img = (np.clip(img, 0, 255)).astype(np.uint8)
+            sy, sx = state["st_scale"]
+            return img, sy, sx
+        elif layer_name == "Similarity":
+            sim_data = sim.data.astype(np.float32)
+            cmap     = mpl_cm.get_cmap(params["colormap"])
+            rgb      = (cmap(sim_data)[:, :, :3] * 255).astype(np.uint8)
+            sy, sx   = state["sim_scale"]
+            return rgb, sy, sx
+        else:
+            raise ValueError(f"Unknown layer: {layer_name}")
+
+    def _boxes_to_pixel_coords(layer_name: str):
+        """
+        Convert SAMBoxes world-coord rectangles to pixel coords [x1,y1,x2,y2]
+        in the space of the given layer.
+        """
+        img_arr, sy, sx = _get_layer_image_and_scale(layer_name)
+        img_h, img_w    = img_arr.shape[:2]
+
+        boxes_px = []
+        for shape_data in sam_boxes.data:
+            # shape_data: (4, 2) array of [world_y, world_x] corner points
+            pts = np.array(shape_data)  # (4, 2)
+            wy_min, wy_max = pts[:, 0].min(), pts[:, 0].max()
+            wx_min, wx_max = pts[:, 1].min(), pts[:, 1].max()
+            # convert world → pixel (row=y/sy, col=x/sx)
+            r1 = int(np.clip(wy_min / sy, 0, img_h - 1))
+            r2 = int(np.clip(wy_max / sy, 0, img_h - 1))
+            c1 = int(np.clip(wx_min / sx, 0, img_w - 1))
+            c2 = int(np.clip(wx_max / sx, 0, img_w - 1))
+            # SAM2 box format: [x1, y1, x2, y2] = [col1, row1, col2, row2]
+            boxes_px.append([float(c1), float(r1), float(c2), float(r2)])
+        return boxes_px
+
+    def _resize_mask_to_lab(mask_hw: np.ndarray) -> np.ndarray:
+        """Resize a bool mask to match lab.data.shape using nearest-neighbour."""
+        target_h, target_w = lab.data.shape[:2]
+        if mask_hw.shape == (target_h, target_w):
+            return mask_hw
+        pil_mask = PILImage.fromarray(mask_hw.astype(np.uint8) * 255)
+        pil_resized = pil_mask.resize((target_w, target_h), PILImage.NEAREST)
+        return np.array(pil_resized) > 127
+
+    def _apply_sam2_results(masks_list: list):
+        """Write SAM2 masks into lab.data, respecting locked IDs."""
+        base_id = int(lab.data.max()) + 1
+        data    = lab.data.copy()
+        locked  = state["locked_ids"]
+        for i, mask in enumerate(masks_list):
+            resized      = _resize_mask_to_lab(mask)
+            write_pixels = resized & (~np.isin(data, list(locked)) if locked else resized)
+            data[write_pixels] = base_id + i
+        lab.data = data
+        lab.refresh()
+        state["prev_labels_snapshot"] = lab.data.copy()
+        _update_lock_overlay()
+        print(f"[SAM2] Applied {len(masks_list)} mask(s), IDs {base_id}–{base_id + len(masks_list) - 1}")
 
     # ── Prefix 加载 ─────────────────────────────────────────────────────────
     def load_prefix(prefix: str):
@@ -364,6 +499,40 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     merge_layout.addLayout(mrg_btn_row)
     merge_grp.setLayout(merge_layout)
 
+    # ---- SAM2 group ----
+    sam2_grp    = QGroupBox("SAM2 Segmentation")
+    sam2_layout = QVBoxLayout();  sam2_layout.setSpacing(6)
+
+    # Row 1: layer selector + server URL
+    sam2_row1 = QHBoxLayout();  sam2_row1.setSpacing(6)
+    sam2_layer_cb = QComboBox()
+    sam2_layer_cb.addItems(["HE", "ST_RGB", "Similarity"])
+    sam2_layer_cb.setCurrentIndex(0)
+    sam2_layer_cb.setToolTip("Layer image to send to SAM2")
+    sam2_url_edit = QLineEdit()
+    sam2_url_edit.setPlaceholderText("http://server:8000")
+    sam2_url_edit.setText("http://localhost:8000")
+    sam2_row1.addWidget(sam2_layer_cb, 1)
+    sam2_row1.addWidget(sam2_url_edit, 2)
+
+    # Row 2: action buttons
+    sam2_row2 = QHBoxLayout();  sam2_row2.setSpacing(6)
+    btn_sam2_draw  = QPushButton("✏ Draw Boxes");  btn_sam2_draw.setObjectName("sam2DrawBtn")
+    btn_sam2_clear = QPushButton("🗑 Clear")
+    btn_sam2_run   = QPushButton("⚡ Run SAM2");    btn_sam2_run.setObjectName("sam2RunBtn")
+    sam2_row2.addWidget(btn_sam2_draw)
+    sam2_row2.addWidget(btn_sam2_clear)
+    sam2_row2.addWidget(btn_sam2_run)
+
+    # Status label
+    lbl_sam2_status = QLabel("Draw boxes, then click Run SAM2")
+    lbl_sam2_status.setObjectName("sam2StatusLabel")
+
+    sam2_layout.addLayout(sam2_row1)
+    sam2_layout.addLayout(sam2_row2)
+    sam2_layout.addWidget(lbl_sam2_status)
+    sam2_grp.setLayout(sam2_layout)
+
     # ---- Save group ----
     save_grp    = QGroupBox("Save")
     save_layout = QHBoxLayout()
@@ -374,6 +543,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     panel_layout.addWidget(mask_grp)
     panel_layout.addWidget(lock_grp)
     panel_layout.addWidget(merge_grp)
+    panel_layout.addWidget(sam2_grp)
     panel_layout.addWidget(save_grp)
     panel_layout.addStretch()
 
@@ -479,6 +649,74 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         _update_lock_overlay()
         _cancel_merge()
 
+    # -- SAM2 --
+    def _sam2_toggle_draw():
+        drawing = not state["sam2_drawing"]
+        state["sam2_drawing"] = drawing
+        if drawing:
+            sam_boxes.mode = "add_rectangle"
+            btn_sam2_draw.setText("◼ Stop Drawing")
+            btn_sam2_draw.setObjectName("sam2DrawActiveBtn")
+            lbl_sam2_status.setText("Draw rectangles on the viewer")
+        else:
+            sam_boxes.mode = "pan_zoom"
+            btn_sam2_draw.setText("✏ Draw Boxes")
+            btn_sam2_draw.setObjectName("sam2DrawBtn")
+            n = len(sam_boxes.data)
+            lbl_sam2_status.setText(f"{n} box(es) ready" if n else "Draw boxes, then click Run SAM2")
+        _refresh_btn_styles()
+
+    def _sam2_clear():
+        sam_boxes.data = []
+        lbl_sam2_status.setText("Boxes cleared")
+
+    def _sam2_run():
+        if state["prefix"] is None:
+            lbl_sam2_status.setText("Load a prefix first")
+            return
+        if len(sam_boxes.data) == 0:
+            lbl_sam2_status.setText("Draw at least one box first")
+            return
+
+        layer_name = sam2_layer_cb.currentText()
+        url        = sam2_url_edit.text().strip()
+        if not url:
+            lbl_sam2_status.setText("Enter the server URL")
+            return
+
+        try:
+            img_arr, _, _ = _get_layer_image_and_scale(layer_name)
+            boxes_px      = _boxes_to_pixel_coords(layer_name)
+        except Exception as exc:
+            lbl_sam2_status.setText(f"Error: {exc}")
+            return
+
+        btn_sam2_run.setEnabled(False)
+        lbl_sam2_status.setText(f"Running SAM2 on {layer_name} ({len(boxes_px)} box(es))…")
+
+        worker = _SAM2Worker(url, img_arr, boxes_px)
+        state["sam2_worker"] = worker   # keep reference alive
+
+        def _on_done(masks_list):
+            _apply_sam2_results(masks_list)
+            btn_sam2_run.setEnabled(True)
+            n = len(masks_list)
+            lbl_sam2_status.setText(f"Done — {n} mask{'s' if n != 1 else ''} applied")
+            # stop drawing mode if active
+            if state["sam2_drawing"]:
+                _sam2_toggle_draw()
+            state["sam2_worker"] = None
+
+        def _on_error(msg):
+            btn_sam2_run.setEnabled(True)
+            lbl_sam2_status.setText(f"Error: {msg}")
+            print(f"[SAM2] Server error: {msg}")
+            state["sam2_worker"] = None
+
+        worker.finished.connect(_on_done)
+        worker.error.connect(_on_error)
+        worker.start()
+
     # -- Save --
     def _save_mask():
         if state["edited_mask_path"] is None:
@@ -502,6 +740,9 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     btn_merge_start.clicked.connect(_start_merge)
     btn_merge_confirm.clicked.connect(_confirm_merge)
     btn_merge_cancel.clicked.connect(_cancel_merge)
+    btn_sam2_draw.clicked.connect(_sam2_toggle_draw)
+    btn_sam2_clear.clicked.connect(_sam2_clear)
+    btn_sam2_run.clicked.connect(_sam2_run)
     btn_save.clicked.connect(_save_mask)
 
     v.window.add_dock_widget(panel, area="right", name="Annotation Tools")
