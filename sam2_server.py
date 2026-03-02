@@ -23,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from PIL import Image as PILImage
 from pydantic import BaseModel
+sys.path.insert(0, "/home/hmaixxz/condo/sam2")
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
@@ -113,8 +114,8 @@ def _parse_args():
     parser = argparse.ArgumentParser(description="SAM2 Segmentation Server")
     parser.add_argument("--host",       default="0.0.0.0",                  help="Bind host")
     parser.add_argument("--port",       default=8000,       type=int,        help="Bind port")
-    parser.add_argument("--config",     default="sam2_hiera_large.yaml",     help="SAM2 config name")
-    parser.add_argument("--checkpoint", default="checkpoints/sam2_hiera_large.pt", help="SAM2 checkpoint path")
+    parser.add_argument("--config",     default="configs/sam2.1/sam2.1_hiera_l.yaml",     help="SAM2 config name (relative to sam2 package)")
+    parser.add_argument("--checkpoint", default="/condo/wanglab/hmaixxz/sam2/checkpoints/sam2.1_hiera_large.pt", help="SAM2 checkpoint path")
     # parse_known_args so uvicorn's own args don't conflict
     args, _ = parser.parse_known_args()
     return args
