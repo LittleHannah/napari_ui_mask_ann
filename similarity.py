@@ -8,6 +8,30 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 
 
+def region_query_vec(
+    emb_norm: np.ndarray,
+    r: int,
+    c: int,
+    radius: int,
+    emb_h: int,
+    emb_w: int,
+) -> np.ndarray:
+    """
+    在 (r, c) 为圆心、radius 为半径（patch 单位）的圆形区域内，
+    平均所有 patch 的 embedding，返回归一化后的 query vector。
+    """
+    rs = np.arange(max(0, r - radius), min(emb_h, r + radius + 1))
+    cs = np.arange(max(0, c - radius), min(emb_w, c + radius + 1))
+    rr, cc = np.meshgrid(rs, cs, indexing="ij")
+    dist = np.sqrt((rr - r) ** 2 + (cc - c) ** 2)
+    in_circle = dist <= radius
+    indices = rr[in_circle] * emb_w + cc[in_circle]
+    vecs = emb_norm[indices]          # (N, D)
+    avg  = vecs.mean(axis=0)          # (D,)
+    norm = np.linalg.norm(avg)
+    return avg / norm if norm > 1e-8 else avg
+
+
 def world_to_emb_rc(
     world_yx,
     sy: float,
@@ -34,9 +58,10 @@ def compute_similarity(
     emb_h: int,
     emb_w: int,
     params: dict,
+    query_vec: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float, float]:
     """
-    以 (r, c) 处的 patch embedding 为 query，计算全图余弦相似度。
+    以 (r, c) 处的 patch embedding（或外部传入的 query_vec）为 query，计算全图余弦相似度。
 
     处理流程：
       1. 余弦相似度（归一化向量点积） → [-1, 1]
@@ -49,7 +74,7 @@ def compute_similarity(
       sim01 : float32 array，shape (emb_h, emb_w)，值域 [0, 1]
       lo/hi : 对应 contrast_limits
     """
-    q = emb_norm[r * emb_w + c]          # (D,)
+    q = query_vec if query_vec is not None else emb_norm[r * emb_w + c]   # (D,)
     sim_flat = emb_norm @ q               # (H*W,)
     sim_img  = sim_flat.reshape(emb_h, emb_w)
     sim01    = (sim_img + 1.0) * 0.5      # [-1,1] → [0,1]

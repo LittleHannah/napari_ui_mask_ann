@@ -4,14 +4,13 @@ viewer.py
 napari viewer 构建器。
 改动：
   1. Lock 可视化：专用 RGBA overlay 图层（黄色高亮锁定区域）+ 回调防重入守卫
-  2. Merge 交互：点击模式选择 → 彩色 overlay 预览 → 确认/取消
-  3. UI：单一 Qt 面板，QGroupBox 分组，深色主题样式
+  2. Merge 交互：点击模式选择 → 确认/取消
+  3. UI：右侧 Qt 面板（Annotation Tools）+ 左侧 Qt 面板（Data Selector）
 """
 
 import base64
 import io
 import os
-from typing import Optional
 
 import matplotlib.cm as mpl_cm
 import numpy as np
@@ -32,7 +31,7 @@ from io_utils import (
     discover_prefixes, ensure_edited_mask_exists,
 )
 from mask_utils import rebuild_instance_table_from_labels, merge_instance_table
-from similarity import world_to_emb_rc, compute_similarity
+from similarity import world_to_emb_rc, compute_similarity, region_query_vec
 
 
 # ── SAM2 worker thread ────────────────────────────────────────────────────────
@@ -50,7 +49,6 @@ class _SAM2Worker(QThread):
 
     def run(self):
         try:
-            # Encode image as PNG bytes → base64 string
             pil_img   = PILImage.fromarray(self._image_arr)
             buf       = io.BytesIO()
             pil_img.save(buf, format="PNG")
@@ -77,6 +75,10 @@ class _SAM2Worker(QThread):
 PANEL_STYLE = """
 QWidget {
     background-color: #2b2b2b;
+}
+QLabel {
+    color: #cccccc;
+    font-size: 12px;
 }
 QGroupBox {
     color: #cccccc;
@@ -135,19 +137,20 @@ QPushButton#sam2DrawBtn { color: #ffdd44; border-color: #7a6a1a; }
 QPushButton#sam2DrawBtn:hover { background-color: #3a3010; }
 QPushButton#sam2DrawActiveBtn { background-color: #3a3010; color: #ffee66; border-color: #aa9922; }
 QLabel#sam2StatusLabel { color: #888888; font-size: 11px; padding: 2px 4px; font-style: italic; }
+
+QPushButton#doneBtn { color: #aaaaaa; border-color: #555; }
+QPushButton#doneBtnActive { background-color: #1a3a5a; color: #55ddff; border-color: #2299cc; font-weight: bold; }
+
+QPushButton#fixSimBtn { color: #cccccc; border-color: #555; }
+QPushButton#fixSimActiveBtn { background-color: #3a1a5a; color: #cc88ff; border-color: #8844cc; font-weight: bold; }
+
+QPushButton#loadBtn { background-color: #1a3a5a; color: #88ccff; border-color: #336699; font-weight: bold; min-height: 28px; }
+QPushButton#loadBtn:hover { background-color: #2a4a6a; }
+
 QComboBox { background-color: #3c3f41; color: #cccccc; border: 1px solid #555555; border-radius: 4px; padding: 3px 6px; }
 QComboBox::drop-down { border: none; }
 QLineEdit { background-color: #3c3f41; color: #cccccc; border: 1px solid #555555; border-radius: 4px; padding: 3px 6px; font-size: 11px; }
 """
-
-# 每个 merge 候选 instance 的高亮颜色（循环使用）
-_MERGE_COLORS = [
-    [0.0, 0.85, 1.0, 1.0],   # cyan
-    [1.0, 0.55, 0.0, 1.0],   # orange
-    [0.85, 0.0, 1.0, 1.0],   # purple
-    [0.0, 1.0, 0.50, 1.0],   # green
-    [1.0, 0.20, 0.55, 1.0],  # pink
-]
 
 
 # ── 主函数 ────────────────────────────────────────────────────────────────────
@@ -164,14 +167,10 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     )
     lab = v.add_labels(np.zeros((10, 10), dtype=np.uint32), name="Mask", opacity=0.5)
 
-    # RGBA overlay：lock（黄色）& merge 候选（彩色）
+    # RGBA overlay：lock（黄色）
     lock_overlay = v.add_image(
         np.zeros((10, 10, 4), dtype=np.float32),
         name="LockOverlay", rgb=True, opacity=0.6,
-    )
-    merge_overlay = v.add_image(
-        np.zeros((10, 10, 4), dtype=np.float32),
-        name="MergeOverlay", rgb=True, opacity=0.72, visible=False,
     )
 
     # SAM2 box prompts layer
@@ -180,13 +179,13 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         edge_color="yellow", face_color="transparent", edge_width=2,
     )
 
-    # Query 标记
-    query_circle = v.add_points(np.zeros((0, 2), dtype=np.float32), name="QueryCircle", size=80)
-    try:    query_circle.face_color = "transparent"
-    except Exception: query_circle.face_color = [0, 0, 0, 0]
-    try:    query_circle.edge_color = "cyan"; query_circle.edge_width = 4
-    except Exception: pass
+    # Query 十字标记
     query_cross = v.add_shapes([], shape_type="line", name="QueryCross", edge_color="cyan", edge_width=3)
+
+    # ── 数据集根目录 ─────────────────────────────────────────────────────────
+    # data_root / experiment_name / size_suffix
+    data_root   = os.path.dirname(os.path.dirname(input_dir))
+    size_suffix = os.path.basename(input_dir)
 
     # ── 状态 ────────────────────────────────────────────────────────────────
     state = {
@@ -208,12 +207,44 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         # sam2
         "sam2_drawing": False,
         "sam2_worker": None,    # holds reference to running QThread to prevent GC
+        # done
+        "done_prefixes": set(),
+        # similarity
+        "sim_fixed": False,
     }
 
+    def _done_file() -> str:
+        return os.path.join(state["input_dir"], "annotation_done.txt")
+
+    def _load_done_set() -> set[str]:
+        f = _done_file()
+        if not os.path.exists(f):
+            return set()
+        with open(f) as fh:
+            return {ln.strip() for ln in fh if ln.strip()}
+
+    def _save_done_set():
+        with open(_done_file(), "w") as f:
+            for p in sorted(state["done_prefixes"]):
+                f.write(p + "\n")
+
+    state["done_prefixes"] = _load_done_set()
+
+    def _discover_datasets() -> list[str]:
+        """List experiment subdirs of data_root that contain a size_suffix subdir."""
+        if not os.path.isdir(data_root):
+            return [os.path.basename(os.path.dirname(input_dir))]
+        result = []
+        for d in sorted(os.listdir(data_root)):
+            if os.path.isdir(os.path.join(data_root, d, size_suffix)):
+                result.append(d)
+        return result or [os.path.basename(os.path.dirname(input_dir))]
+
     params = {
-        "sigma": 0.6, "gamma": 0.7,
+        "sigma": 1.5, "gamma": 0.7,
         "q_low": 0.05, "q_high": 0.995,
         "colormap": "turbo", "auto_show_sim": False,
+        "query_radius": 6,
     }
     CMAPS = sorted(AVAILABLE_COLORMAPS.keys())
 
@@ -242,35 +273,25 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         shape  = lab.data.shape[:2]
         ov = np.zeros((*shape, 4), dtype=np.float32)
         for lid in locked:
-            ov[lab.data == lid] = [1.0, 0.88, 0.0, 1.0]   # bright yellow, full alpha
+            ov[lab.data == lid] = [1.0, 0.88, 0.0, 1.0]
         lock_overlay.data  = ov
         lock_overlay.scale = lab.scale
 
-    def _update_merge_overlay():
-        """用不同颜色 RGBA 高亮每个 merge 候选 instance。"""
-        candidates = state["merge_candidates"]
-        shape = lab.data.shape[:2]
-        if not candidates:
-            merge_overlay.data    = np.zeros((*shape, 4), dtype=np.float32)
-            merge_overlay.visible = False
-            return
-        ov = np.zeros((*shape, 4), dtype=np.float32)
-        for i, lid in enumerate(sorted(candidates)):
-            ov[lab.data == lid] = _MERGE_COLORS[i % len(_MERGE_COLORS)]
-        merge_overlay.data    = ov
-        merge_overlay.scale   = lab.scale
-        merge_overlay.visible = True
-
     def _render_similarity(r, c, world_yx):
+        radius = int(params["query_radius"])
+        qvec = None
+        if radius > 0:
+            qvec = region_query_vec(
+                state["emb_norm"], r, c, radius, state["emb_h"], state["emb_w"],
+            )
         sim01, lo, hi = compute_similarity(
-            state["emb_norm"], r, c, state["emb_h"], state["emb_w"], params,
+            state["emb_norm"], r, c, state["emb_h"], state["emb_w"], params, query_vec=qvec,
         )
         sim.data = sim01
         try: sim.contrast_limits = (lo, hi)
         except Exception: pass
 
         wy, wx = float(world_yx[0]), float(world_yx[1])
-        query_circle.data = np.asarray([[wy, wx]], dtype=np.float32)
         L = 70
         query_cross.data = [
             np.array([[wy - L, wx], [wy + L, wx]], dtype=np.float32),
@@ -304,25 +325,19 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             raise ValueError(f"Unknown layer: {layer_name}")
 
     def _boxes_to_pixel_coords(layer_name: str):
-        """
-        Convert SAMBoxes world-coord rectangles to pixel coords [x1,y1,x2,y2]
-        in the space of the given layer.
-        """
+        """Convert SAMBoxes world-coord rectangles to pixel coords [x1,y1,x2,y2]."""
         img_arr, sy, sx = _get_layer_image_and_scale(layer_name)
         img_h, img_w    = img_arr.shape[:2]
 
         boxes_px = []
         for shape_data in sam_boxes.data:
-            # shape_data: (4, 2) array of [world_y, world_x] corner points
             pts = np.array(shape_data)  # (4, 2)
             wy_min, wy_max = pts[:, 0].min(), pts[:, 0].max()
             wx_min, wx_max = pts[:, 1].min(), pts[:, 1].max()
-            # convert world → pixel (row=y/sy, col=x/sx)
             r1 = int(np.clip(wy_min / sy, 0, img_h - 1))
             r2 = int(np.clip(wy_max / sy, 0, img_h - 1))
             c1 = int(np.clip(wx_min / sx, 0, img_w - 1))
             c2 = int(np.clip(wx_max / sx, 0, img_w - 1))
-            # SAM2 box format: [x1, y1, x2, y2] = [col1, row1, col2, row2]
             boxes_px.append([float(c1), float(r1), float(c2), float(r2)])
         return boxes_px
 
@@ -352,7 +367,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     # ── Prefix 加载 ─────────────────────────────────────────────────────────
     def load_prefix(prefix: str):
-        p = ensure_edited_mask_exists(input_dir, prefix)
+        p = ensure_edited_mask_exists(state["input_dir"], prefix)
 
         he_rgb  = load_he_rgb(p["he_path"])
         st_rgb  = load_rgb_png(p["rgb_png_path"])
@@ -417,12 +432,11 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         emb = emb_pca.astype(np.float32, copy=False).reshape(-1, emb_d)
         state["emb_norm"] = normalize_rows(emb)
 
-        query_circle.data = np.zeros((0, 2), dtype=np.float32)
         query_cross.data  = []
         state["prev_labels_snapshot"] = lab.data.copy()
 
         _update_lock_overlay()
-        _update_merge_overlay()
+        _update_done_btn()
         print(f"[Load] {prefix} | HE={he_rgb.shape} ST={st_rgb.shape} EMB={emb_pca.shape} MASK={label_img.shape}")
 
     # ── Similarity controls widget (magicgui) ───────────────────────────────
@@ -433,16 +447,19 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         q_high={"min": 0.5, "max": 1.0, "step": 0.005},
         colormap={"choices": CMAPS},
         auto_show_sim={"widget_type": "CheckBox"},
+        query_radius={"min": 0, "max": 20, "step": 1, "label": "Query Radius (patches)"},
     )
     def controls(
-        sigma: float = 0.6, gamma: float = 0.7,
+        sigma: float = 1.5, gamma: float = 0.7,
         q_low: float = 0.05, q_high: float = 0.995,
         colormap: str = "turbo", auto_show_sim: bool = False,
+        query_radius: int = 6,
     ):
         params.update(dict(
             sigma=float(sigma), gamma=float(gamma),
             q_low=float(q_low), q_high=float(q_high),
             colormap=str(colormap), auto_show_sim=bool(auto_show_sim),
+            query_radius=int(query_radius),
         ))
         _set_colormap_safe(params["colormap"])
         if state["last_query"]["r"] is not None:
@@ -452,8 +469,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     v.window.add_dock_widget(controls, area="right", name="Similarity Controls")
 
-    # ── Qt Annotation Panel ──────────────────────────────────────────────────
-    # 先创建所有 Qt 控件（action functions 需要引用它们）
+    # ── Qt Annotation Panel (right) ──────────────────────────────────────────
 
     panel = QWidget()
     panel.setObjectName("AnnotationPanel")
@@ -462,12 +478,25 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     panel_layout.setContentsMargins(8, 8, 8, 8)
     panel.setStyleSheet(PANEL_STYLE)
 
+    # ---- Similarity Fix group ----
+    sim_grp    = QGroupBox("Similarity")
+    sim_layout = QVBoxLayout();  sim_layout.setSpacing(6)
+    btn_fix_sim = QPushButton("📌 Fix Similarity Map")
+    btn_fix_sim.setObjectName("fixSimBtn")
+    sim_layout.addWidget(btn_fix_sim)
+    sim_grp.setLayout(sim_layout)
+
     # ---- Mask group ----
     mask_grp    = QGroupBox("Mask")
-    mask_layout = QHBoxLayout();  mask_layout.setSpacing(6)
+    mask_layout = QVBoxLayout();  mask_layout.setSpacing(6)
+    mask_row1   = QHBoxLayout();  mask_row1.setSpacing(6)
     btn_add = QPushButton("＋ Add Instance")
-    btn_del = QPushButton("✕ Delete");  btn_del.setObjectName("deleteBtn")
-    mask_layout.addWidget(btn_add);  mask_layout.addWidget(btn_del)
+    btn_del = QPushButton("✕ Delete Selected");  btn_del.setObjectName("deleteBtn")
+    mask_row1.addWidget(btn_add);  mask_row1.addWidget(btn_del)
+    btn_del_unlocked = QPushButton("🗑 Delete All Unlocked")
+    btn_del_unlocked.setObjectName("deleteBtn")
+    mask_layout.addLayout(mask_row1)
+    mask_layout.addWidget(btn_del_unlocked)
     mask_grp.setLayout(mask_layout)
 
     # ---- Lock group ----
@@ -503,7 +532,6 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     sam2_grp    = QGroupBox("SAM2 Segmentation")
     sam2_layout = QVBoxLayout();  sam2_layout.setSpacing(6)
 
-    # Row 1: layer selector + server URL
     sam2_row1 = QHBoxLayout();  sam2_row1.setSpacing(6)
     sam2_layer_cb = QComboBox()
     sam2_layer_cb.addItems(["HE", "ST_RGB", "Similarity"])
@@ -515,7 +543,6 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     sam2_row1.addWidget(sam2_layer_cb, 1)
     sam2_row1.addWidget(sam2_url_edit, 2)
 
-    # Row 2: action buttons
     sam2_row2 = QHBoxLayout();  sam2_row2.setSpacing(6)
     btn_sam2_draw  = QPushButton("✏ Draw Boxes");  btn_sam2_draw.setObjectName("sam2DrawBtn")
     btn_sam2_clear = QPushButton("🗑 Clear")
@@ -524,7 +551,6 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     sam2_row2.addWidget(btn_sam2_clear)
     sam2_row2.addWidget(btn_sam2_run)
 
-    # Status label
     lbl_sam2_status = QLabel("Draw boxes, then click Run SAM2")
     lbl_sam2_status.setObjectName("sam2StatusLabel")
 
@@ -535,11 +561,14 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     # ---- Save group ----
     save_grp    = QGroupBox("Save")
-    save_layout = QHBoxLayout()
+    save_layout = QVBoxLayout();  save_layout.setSpacing(6)
     btn_save = QPushButton("💾  Save Mask  (npy + csv)");  btn_save.setObjectName("saveBtn")
+    btn_mark_done = QPushButton("◻  Mark Tile as Done");   btn_mark_done.setObjectName("doneBtn")
     save_layout.addWidget(btn_save)
+    save_layout.addWidget(btn_mark_done)
     save_grp.setLayout(save_layout)
 
+    panel_layout.addWidget(sim_grp)
     panel_layout.addWidget(mask_grp)
     panel_layout.addWidget(lock_grp)
     panel_layout.addWidget(merge_grp)
@@ -547,13 +576,78 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     panel_layout.addWidget(save_grp)
     panel_layout.addStretch()
 
-    # ── Action functions（引用上面的 Qt 控件）──────────────────────────────
+    # ── Qt Data Selector Panel (left) ────────────────────────────────────────
+
+    left_panel = QWidget()
+    left_panel.setObjectName("DataSelectorPanel")
+    left_layout = QVBoxLayout(left_panel)
+    left_layout.setSpacing(10)
+    left_layout.setContentsMargins(8, 8, 8, 8)
+    left_panel.setStyleSheet(PANEL_STYLE)
+
+    ds_grp    = QGroupBox("Data Selection")
+    ds_layout = QVBoxLayout();  ds_layout.setSpacing(6)
+
+    lbl_dataset = QLabel("Dataset folder:")
+    dataset_cb  = QComboBox()
+    dataset_cb.addItems(_discover_datasets())
+    _cur_ds = os.path.basename(os.path.dirname(input_dir))
+    _idx = dataset_cb.findText(_cur_ds)
+    if _idx >= 0:
+        dataset_cb.setCurrentIndex(_idx)
+
+    lbl_prefix = QLabel("Prefix:")
+    prefix_cb  = QComboBox()
+
+    btn_load_prefix = QPushButton("Load Selected Prefix")
+    btn_load_prefix.setObjectName("loadBtn")
+
+    ds_layout.addWidget(lbl_dataset)
+    ds_layout.addWidget(dataset_cb)
+    ds_layout.addWidget(lbl_prefix)
+    ds_layout.addWidget(prefix_cb)
+    ds_layout.addWidget(btn_load_prefix)
+    ds_grp.setLayout(ds_layout)
+
+    left_layout.addWidget(ds_grp)
+    left_layout.addStretch()
+
+    # ── Action functions ─────────────────────────────────────────────────────
 
     def _refresh_btn_styles():
         """objectName 变更后强制重新应用样式。"""
         ss = panel.styleSheet()
         panel.setStyleSheet("")
         panel.setStyleSheet(ss)
+
+    def _refresh_prefix_cb():
+        """Repopulate prefix_cb with current dataset's prefixes (preserving selection)."""
+        done  = state["done_prefixes"]
+        prefs = discover_prefixes(state["input_dir"])
+        items = [f"{p} ✓" if p in done else p for p in prefs]
+        # Preserve current selection
+        cur_text  = prefix_cb.currentText()
+        cur_clean = cur_text[:-2] if cur_text.endswith(" ✓") else cur_text
+        prefix_cb.blockSignals(True)
+        prefix_cb.clear()
+        prefix_cb.addItems(items)
+        for i, item in enumerate(items):
+            if (item[:-2] if item.endswith(" ✓") else item) == cur_clean:
+                prefix_cb.setCurrentIndex(i)
+                break
+        prefix_cb.blockSignals(False)
+
+    # -- Fix Similarity --
+    def _toggle_fix_sim():
+        fixed = not state["sim_fixed"]
+        state["sim_fixed"] = fixed
+        if fixed:
+            btn_fix_sim.setText("🔓 Unfix Similarity")
+            btn_fix_sim.setObjectName("fixSimActiveBtn")
+        else:
+            btn_fix_sim.setText("📌 Fix Similarity Map")
+            btn_fix_sim.setObjectName("fixSimBtn")
+        _refresh_btn_styles()
 
     # -- Mask --
     def _add_instance():
@@ -576,6 +670,22 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             print(f"[Mask] Deleted id = {sel}")
         else:
             print(f"[Mask] Id {sel} not found.")
+
+    def _delete_unlocked():
+        locked = state["locked_ids"]
+        data   = lab.data
+        all_ids  = set(np.unique(data).tolist()) - {0}
+        unlocked = all_ids - locked
+        if not unlocked:
+            print("[Mask] No unlocked instances to delete.")
+            return
+        data = data.copy()
+        data[np.isin(data, list(unlocked))] = 0
+        lab.data = data
+        lab.refresh()
+        state["prev_labels_snapshot"] = lab.data.copy()
+        _update_lock_overlay()
+        print(f"[Mask] Deleted {len(unlocked)} unlocked instance(s): {sorted(unlocked)}")
 
     # -- Lock --
     def _lock_selected():
@@ -603,10 +713,9 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     # -- Merge state machine --
     def _start_merge():
-        state["merge_active"]    = True
+        state["merge_active"]     = True
         state["merge_candidates"] = set()
-        _update_merge_overlay()
-        try:  lab.mode = "pan_zoom"   # 切换到 pan 防止误刷 label
+        try:  lab.mode = "pan_zoom"
         except Exception: pass
         btn_merge_start.setText("● Selecting...")
         btn_merge_start.setObjectName("mergeActiveBtn")
@@ -617,9 +726,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         _refresh_btn_styles()
 
     def _cancel_merge():
-        state["merge_active"]    = False
+        state["merge_active"]     = False
         state["merge_candidates"] = set()
-        _update_merge_overlay()
         btn_merge_start.setText("▶ Start Select")
         btn_merge_start.setObjectName("mergeStartBtn")
         btn_merge_start.setEnabled(True)
@@ -695,14 +803,13 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         lbl_sam2_status.setText(f"Running SAM2 on {layer_name} ({len(boxes_px)} box(es))…")
 
         worker = _SAM2Worker(url, img_arr, boxes_px)
-        state["sam2_worker"] = worker   # keep reference alive
+        state["sam2_worker"] = worker
 
         def _on_done(masks_list):
             _apply_sam2_results(masks_list)
             btn_sam2_run.setEnabled(True)
             n = len(masks_list)
             lbl_sam2_status.setText(f"Done — {n} mask{'s' if n != 1 else ''} applied")
-            # stop drawing mode if active
             if state["sam2_drawing"]:
                 _sam2_toggle_draw()
             state["sam2_worker"] = None
@@ -731,9 +838,55 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             rebuild_instance_table_from_labels(lab.data).to_csv(state["edited_csv_path"], index=False)
             print(f"[Mask] Saved rebuilt csv → {state['edited_csv_path']}")
 
+    # -- Mark Done --
+    def _update_done_btn():
+        prefix = state["prefix"]
+        if prefix and prefix in state["done_prefixes"]:
+            btn_mark_done.setText("✓  Done  (click to unmark)")
+            btn_mark_done.setObjectName("doneBtnActive")
+        else:
+            btn_mark_done.setText("◻  Mark Tile as Done")
+            btn_mark_done.setObjectName("doneBtn")
+        _refresh_btn_styles()
+
+    def _mark_done():
+        prefix = state["prefix"]
+        if prefix is None:
+            print("[Done] Load a prefix first.");  return
+        done = state["done_prefixes"]
+        if prefix in done:
+            done.remove(prefix)
+            print(f"[Done] Unmarked {prefix}")
+        else:
+            done.add(prefix)
+            print(f"[Done] Marked {prefix} as complete")
+        _save_done_set()
+        _update_done_btn()
+        _refresh_prefix_cb()
+
+    # -- Dataset / Prefix selectors --
+    def _on_dataset_change():
+        chosen  = dataset_cb.currentText()
+        new_dir = os.path.join(data_root, chosen, size_suffix)
+        if not os.path.isdir(new_dir):
+            return
+        state["input_dir"]    = new_dir
+        state["done_prefixes"] = _load_done_set()
+        _refresh_prefix_cb()
+        print(f"[Dataset] Switched to {chosen}")
+
+    def _load_prefix_btn():
+        text = prefix_cb.currentText()
+        if not text:
+            print("[Load] No prefix selected.");  return
+        clean = text[:-2] if text.endswith(" ✓") else text
+        load_prefix(clean)
+
     # ── 连接按钮 ─────────────────────────────────────────────────────────────
+    btn_fix_sim.clicked.connect(_toggle_fix_sim)
     btn_add.clicked.connect(_add_instance)
     btn_del.clicked.connect(_delete_instance)
+    btn_del_unlocked.clicked.connect(_delete_unlocked)
     btn_lock.clicked.connect(_lock_selected)
     btn_unlock.clicked.connect(_unlock_selected)
     btn_unlock_a.clicked.connect(_unlock_all)
@@ -744,15 +897,24 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     btn_sam2_clear.clicked.connect(_sam2_clear)
     btn_sam2_run.clicked.connect(_sam2_run)
     btn_save.clicked.connect(_save_mask)
+    btn_mark_done.clicked.connect(_mark_done)
+    dataset_cb.currentTextChanged.connect(lambda _: _on_dataset_change())
+    btn_load_prefix.clicked.connect(_load_prefix_btn)
 
     v.window.add_dock_widget(panel, area="right", name="Annotation Tools")
+    v.window.add_dock_widget(left_panel, area="left", name="Data Selector")
 
-    # ── 鼠标回调（引用 Qt 控件，必须在控件创建后定义）────────────────────────
+    # ── 键盘快捷键 ────────────────────────────────────────────────────────────
+    @v.bind_key("q")
+    def _hotkey_lock(viewer):
+        """Q — Lock currently selected instance."""
+        _lock_selected()
+
+    # ── 鼠标回调 ─────────────────────────────────────────────────────────────
 
     def mouse_cb(viewer, event):
         if event.type == "mouse_press" and event.button == 1:
             if state["merge_active"]:
-                # Merge 选择模式：点击 → 切换候选集合
                 world_yx = event.position[:2]
                 r, c     = _world_to_label_rc(world_yx)
                 lid      = int(lab.data[r, c])
@@ -763,14 +925,19 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
                     cands.discard(lid)
                 else:
                     cands.add(lid)
-                _update_merge_overlay()
                 lbl_merge_status.setText(
                     f"Selected: {sorted(cands)}" if cands else "Click instances to select"
                 )
                 yield;  return
 
-            # 普通模式：计算相似度
+            # 普通模式：计算相似度（固定时跳过）
+            if sam_boxes.mode != "pan_zoom":
+                yield;  return
+            if lab.mode not in ("pan_zoom", "pick"):
+                yield;  return
             if state["emb_norm"] is None:
+                yield;  return
+            if state["sim_fixed"]:
                 yield;  return
             world_yx = event.position[:2]
             r, c = world_to_emb_rc(world_yx, state["sy"], state["sx"], state["emb_h"], state["emb_w"])
@@ -793,7 +960,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         if not locked:
             state["prev_labels_snapshot"] = cur.copy();  return
 
-        changed     = (cur != prev)
+        changed = (cur != prev)
         bad = changed & (np.isin(prev, list(locked)) | np.isin(cur, list(locked)))
         if bad.any():
             _lg["reverting"] = True
@@ -813,31 +980,21 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     except Exception:
         pass
 
-    # ── Data selector (magicgui) ────────────────────────────────────────────
-    prefixes = discover_prefixes(input_dir)
-    default_prefix = (
-        initial_prefix if (initial_prefix in prefixes)
-        else (prefixes[0] if prefixes else None)
+    # ── 初始化 prefix 列表 & 加载 ─────────────────────────────────────────────
+    _refresh_prefix_cb()
+
+    _raw_prefixes = discover_prefixes(state["input_dir"])
+    _raw_default  = (
+        initial_prefix if (initial_prefix in _raw_prefixes)
+        else (_raw_prefixes[0] if _raw_prefixes else None)
     )
-
-    @magicgui(
-        call_button="Load Selected Prefix",
-        prefix={"choices": lambda w: discover_prefixes(input_dir)},
-    )
-    def selector(prefix: Optional[str] = default_prefix):
-        if not prefix:
-            print("[Load] No prefix selected.");  return
-        load_prefix(prefix)
-
-    v.window.add_dock_widget(selector, area="right", name="Data Selector")
-
-    # ── 初始加载 ────────────────────────────────────────────────────────────
-    prefixes = discover_prefixes(input_dir)
-    if initial_prefix is None:
-        initial_prefix = prefixes[0] if prefixes else None
-    if initial_prefix is not None:
-        load_prefix(initial_prefix)
+    if _raw_default is not None:
+        _display_val = f"{_raw_default} ✓" if _raw_default in state["done_prefixes"] else _raw_default
+        _idx2 = prefix_cb.findText(_display_val)
+        if _idx2 >= 0:
+            prefix_cb.setCurrentIndex(_idx2)
+        load_prefix(_raw_default)
     else:
-        print(f"[Init] No valid prefixes found in: {input_dir}")
+        print(f"[Init] No valid prefixes found in: {state['input_dir']}")
 
     return v

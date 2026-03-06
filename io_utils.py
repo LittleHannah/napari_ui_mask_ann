@@ -82,7 +82,7 @@ def paths_for_prefix(input_dir: str, prefix: str) -> dict[str, str]:
     """
     he_path      = os.path.join(input_dir, "HE",          f"{prefix}_he.png")
     rgb_png_path = os.path.join(input_dir, "pca_rgb_no",  f"{prefix}_rgb.png")
-    pca_path     = os.path.join(input_dir, "pca50",       f"{prefix}_pca.npy")
+    pca_path     = os.path.join(input_dir, "emb",       f"{prefix}_emb.npy")
 
     mask_dir       = os.path.join(input_dir, "sam2_merged_masks")
     mask_path      = os.path.join(mask_dir,  f"{prefix}_merged_mask.npy")
