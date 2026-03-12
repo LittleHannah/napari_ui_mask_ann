@@ -202,6 +202,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         "prev_labels_snapshot": None,
         # paths
         "edited_mask_path": None, "edited_csv_path": None, "raw_csv_path": None,
+        "locked_ids_path": None,
         # merge
         "merge_active": False, "merge_candidates": set(),
         # sam2
@@ -425,9 +426,18 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             sy=sim_scale[0], sx=sim_scale[1],
             edited_mask_path=p["edited_mask_path"],
             edited_csv_path=p["edited_csv_path"],
+            locked_ids_path=p["locked_ids_path"],
             locked_ids=set(),
             merge_active=False, merge_candidates=set(),
         ))
+
+        # 从文件恢复锁定 ID
+        _lpath = p["locked_ids_path"]
+        if os.path.exists(_lpath):
+            import json
+            with open(_lpath) as _f:
+                state["locked_ids"] = set(json.load(_f))
+            print(f"[Lock] Restored {len(state['locked_ids'])} locked ID(s) from file")
 
         emb = emb_pca.astype(np.float32, copy=False).reshape(-1, emb_d)
         state["emb_norm"] = normalize_rows(emb)
@@ -837,6 +847,10 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         else:
             rebuild_instance_table_from_labels(lab.data).to_csv(state["edited_csv_path"], index=False)
             print(f"[Mask] Saved rebuilt csv → {state['edited_csv_path']}")
+        import json
+        with open(state["locked_ids_path"], "w") as _f:
+            json.dump(sorted(state["locked_ids"]), _f)
+        print(f"[Lock] Saved {len(state['locked_ids'])} locked ID(s) → {state['locked_ids_path']}")
 
     # -- Mark Done --
     def _update_done_btn():

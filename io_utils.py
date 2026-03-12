@@ -83,6 +83,8 @@ def paths_for_prefix(input_dir: str, prefix: str) -> dict[str, str]:
     he_path      = os.path.join(input_dir, "HE",          f"{prefix}_he.png")
     rgb_png_path = os.path.join(input_dir, "pca_rgb_no",  f"{prefix}_rgb.png")
     pca_path     = os.path.join(input_dir, "emb",       f"{prefix}_emb.npy")
+    if not os.path.exists(pca_path):
+        pca_path = os.path.join(input_dir, "pca50", f"{prefix}_pca.npy")
 
     mask_dir       = os.path.join(input_dir, "sam2_merged_masks")
     mask_path      = os.path.join(mask_dir,  f"{prefix}_merged_mask.npy")
@@ -90,6 +92,7 @@ def paths_for_prefix(input_dir: str, prefix: str) -> dict[str, str]:
 
     edited_mask_path = mask_path.replace(".npy", "_edited.npy")
     edited_csv_path  = mask_label_csv.replace(".csv", "_edited.csv")
+    locked_ids_path  = os.path.join(mask_dir, f"{prefix}_locked_ids.json")
 
     return dict(
         he_path=he_path,
@@ -99,6 +102,7 @@ def paths_for_prefix(input_dir: str, prefix: str) -> dict[str, str]:
         mask_label_csv=mask_label_csv,
         edited_mask_path=edited_mask_path,
         edited_csv_path=edited_csv_path,
+        locked_ids_path=locked_ids_path,
     )
 
 
