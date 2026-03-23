@@ -273,8 +273,9 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         locked = state["locked_ids"]
         shape  = lab.data.shape[:2]
         ov = np.zeros((*shape, 4), dtype=np.float32)
-        for lid in locked:
-            ov[lab.data == lid] = [1.0, 0.88, 0.0, 1.0]
+        if locked:
+            mask = np.isin(lab.data, list(locked))
+            ov[mask] = [1.0, 0.88, 0.0, 1.0]
         lock_overlay.data  = ov
         lock_overlay.scale = lab.scale
 
@@ -370,13 +371,24 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     def load_prefix(prefix: str):
         p = ensure_edited_mask_exists(state["input_dir"], prefix)
 
-        he_rgb  = load_he_rgb(p["he_path"])
         st_rgb  = load_rgb_png(p["rgb_png_path"])
         emb_pca = np.load(p["pca_path"])
+        st_h, st_w        = st_rgb.shape[:2]
+        emb_h, emb_w, emb_d = emb_pca.shape
+
+        if os.path.exists(p["he_path"]):
+            he_rgb     = load_he_rgb(p["he_path"])
+            he.data    = he_rgb
+            he.visible = True
+        else:
+            # no HE (e.g. slide mode): use ST_RGB dims as reference, hide layer
+            he_rgb     = np.zeros((st_h, st_w, 3), dtype=np.uint8)
+            he.data    = he_rgb
+            he.visible = False
+            if sam2_layer_cb.currentText() == "HE":
+                sam2_layer_cb.setCurrentIndex(1)   # fall back to ST_RGB
 
         he_h, he_w   = he_rgb.shape[:2]
-        st_h, st_w   = st_rgb.shape[:2]
-        emb_h, emb_w, emb_d = emb_pca.shape
         st_scale  = (he_h / st_h,  he_w / st_w)
         sim_scale = (he_h / emb_h, he_w / emb_w)
 
@@ -398,7 +410,6 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
                 f"mask shape {label_img.shape} not match HE {(he_h, he_w)} or EMB {(emb_h, emb_w)}"
             )
 
-        he.data = he_rgb
         st.data = st_rgb;  st.scale = st_scale
         sim.data = np.zeros((emb_h, emb_w), dtype=np.float32)
         sim.scale = sim_scale
@@ -703,7 +714,9 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         if sel == 0:
             print("[Lock] Cannot lock background.");  return
         state["locked_ids"].add(sel)
-        state["prev_labels_snapshot"] = lab.data.copy()
+        # 首次 lock 时确保 snapshot 已建立（保护回调需要它）
+        if state["prev_labels_snapshot"] is None:
+            state["prev_labels_snapshot"] = lab.data.copy()
         _update_lock_overlay()
         print(f"[Lock] Locked id = {sel}")
 
@@ -968,10 +981,12 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             return
         prev   = state["prev_labels_snapshot"]
         cur    = lab.data
-        if prev is None or prev.shape != cur.shape:
-            state["prev_labels_snapshot"] = cur.copy();  return
         locked = state["locked_ids"]
         if not locked:
+            # 没有锁定 ID 时不需要维护 snapshot，跳过全图 copy
+            state["prev_labels_snapshot"] = None
+            return
+        if prev is None or prev.shape != cur.shape:
             state["prev_labels_snapshot"] = cur.copy();  return
 
         changed = (cur != prev)
@@ -998,11 +1013,19 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     _refresh_prefix_cb()
 
     _raw_prefixes = discover_prefixes(state["input_dir"])
-    _raw_default  = (
-        initial_prefix if (initial_prefix in _raw_prefixes)
-        else (_raw_prefixes[0] if _raw_prefixes else None)
-    )
-    if _raw_default is not None:
+
+    # initial_prefix が discover_prefixes の外にある場合（例: "slide"）も直接ロード可能
+    if initial_prefix is not None and initial_prefix not in _raw_prefixes:
+        from io_utils import paths_for_prefix
+        _p = paths_for_prefix(state["input_dir"], initial_prefix)
+        if os.path.exists(_p["rgb_png_path"]) and os.path.exists(_p["pca_path"]):
+            load_prefix(initial_prefix)
+        else:
+            print(f"[Init] initial_prefix '{initial_prefix}' files not found, falling back.")
+            if _raw_prefixes:
+                load_prefix(_raw_prefixes[0])
+    elif _raw_prefixes:
+        _raw_default = initial_prefix if initial_prefix in _raw_prefixes else _raw_prefixes[0]
         _display_val = f"{_raw_default} ✓" if _raw_default in state["done_prefixes"] else _raw_default
         _idx2 = prefix_cb.findText(_display_val)
         if _idx2 >= 0:
