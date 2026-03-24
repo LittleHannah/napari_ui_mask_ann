@@ -354,13 +354,37 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     def _apply_sam2_results(masks_list: list):
         """Write SAM2 masks into lab.data, respecting locked IDs."""
-        base_id = int(lab.data.max()) + 1
-        data    = lab.data.copy()
-        locked  = state["locked_ids"]
-        for i, mask in enumerate(masks_list):
-            resized      = _resize_mask_to_lab(mask)
+        base_id   = int(lab.data.max()) + 1
+        data      = lab.data.copy()
+        locked    = state["locked_ids"]
+        lab_h, lab_w = data.shape[:2]
+        crop_info = state.pop("sam2_crop", None)
+
+        for i, mask_crop in enumerate(masks_list):
+            if crop_info is not None:
+                crop_r0, crop_c0, sy, sx = crop_info
+                # resize crop mask from image-pixel space to lab-pixel space
+                crop_h_img, crop_w_img = mask_crop.shape[:2]
+                crop_h_lab = max(1, round(crop_h_img * sy))
+                crop_w_lab = max(1, round(crop_w_img * sx))
+                pil_m = PILImage.fromarray(mask_crop.astype(np.uint8) * 255)
+                pil_m = pil_m.resize((crop_w_lab, crop_h_lab), PILImage.NEAREST)
+                resized_crop = np.array(pil_m) > 127
+
+                # paste into a full-size bool mask at the correct offset
+                lab_r0 = round(crop_r0 * sy)
+                lab_c0 = round(crop_c0 * sx)
+                lab_r1 = min(lab_r0 + crop_h_lab, lab_h)
+                lab_c1 = min(lab_c0 + crop_w_lab, lab_w)
+                resized = np.zeros((lab_h, lab_w), dtype=bool)
+                resized[lab_r0:lab_r1, lab_c0:lab_c1] = \
+                    resized_crop[:lab_r1 - lab_r0, :lab_c1 - lab_c0]
+            else:
+                resized = _resize_mask_to_lab(mask_crop)
+
             write_pixels = resized & (~np.isin(data, list(locked)) if locked else resized)
             data[write_pixels] = base_id + i
+
         lab.data = data
         lab.refresh()
         state["prev_labels_snapshot"] = lab.data.copy()
@@ -816,16 +840,38 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             return
 
         try:
-            img_arr, _, _ = _get_layer_image_and_scale(layer_name)
-            boxes_px      = _boxes_to_pixel_coords(layer_name)
+            img_arr, sy, sx = _get_layer_image_and_scale(layer_name)
+            boxes_px        = _boxes_to_pixel_coords(layer_name)
         except Exception as exc:
             lbl_sam2_status.setText(f"Error: {exc}")
             return
 
-        btn_sam2_run.setEnabled(False)
-        lbl_sam2_status.setText(f"Running SAM2 on {layer_name} ({len(boxes_px)} box(es))…")
+        # ── Crop image to union of boxes + padding ────────────────────────────
+        SAM2_CROP_PAD = 64   # pixels in image space
+        img_h, img_w  = img_arr.shape[:2]
+        all_x1 = int(min(b[0] for b in boxes_px))
+        all_y1 = int(min(b[1] for b in boxes_px))
+        all_x2 = int(max(b[2] for b in boxes_px))
+        all_y2 = int(max(b[3] for b in boxes_px))
+        crop_x1 = max(0, all_x1 - SAM2_CROP_PAD)
+        crop_y1 = max(0, all_y1 - SAM2_CROP_PAD)
+        crop_x2 = min(img_w, all_x2 + SAM2_CROP_PAD)
+        crop_y2 = min(img_h, all_y2 + SAM2_CROP_PAD)
 
-        worker = _SAM2Worker(url, img_arr, boxes_px)
+        crop_img  = img_arr[crop_y1:crop_y2, crop_x1:crop_x2]
+        crop_boxes = [[b[0] - crop_x1, b[1] - crop_y1,
+                       b[2] - crop_x1, b[3] - crop_y1] for b in boxes_px]
+
+        # store crop origin in image-pixel space so _apply_sam2_results can
+        # paste the masks back at the right position in lab.data
+        state["sam2_crop"] = (crop_y1, crop_x1, sy, sx)
+        print(f"[SAM2] Crop {crop_img.shape[:2]}  origin=({crop_y1},{crop_x1})")
+        # ─────────────────────────────────────────────────────────────────────
+
+        btn_sam2_run.setEnabled(False)
+        lbl_sam2_status.setText(f"Running SAM2 on {layer_name} ({len(crop_boxes)} box(es))…")
+
+        worker = _SAM2Worker(url, crop_img, crop_boxes)
         state["sam2_worker"] = worker
 
         def _on_done(masks_list):
