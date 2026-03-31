@@ -123,6 +123,50 @@ def build_global_emb_canvas(pca_path: str, coords_path: str,
     return emb_flat.reshape(emb_H, emb_W, D)
 
 
+def build_global_rgb_canvas(pca3_path: str, coords_path: str,
+                            canvas_H: int, canvas_W: int) -> np.ndarray:
+    """
+    用全局 pca3 embedding + 坐标文件构建 slide-level RGB canvas。
+
+    pca3_path   : (N, 3) float32 — 3D PCA 向量，3维直接对应 R/G/B
+    coords_path : (N, 2) float32 — 每个向量的 array 坐标 (row, col)
+    返回 (canvas_H, canvas_W, 3) uint8，per-channel 2~98% 分位数归一化。
+    """
+    print("[GlobalRGB] Loading pca3 and coords...")
+    pca3   = np.load(pca3_path).astype(np.float32)    # (N, 3)
+    coords = np.load(coords_path).astype(np.float32)  # (N, 2)
+    N = pca3.shape[0]
+
+    rows = np.clip(coords[:, 0].astype(np.int32), 0, canvas_H - 1)
+    cols = np.clip(coords[:, 1].astype(np.int32), 0, canvas_W - 1)
+    flat_idx = (rows * canvas_W + cols).astype(np.int32)
+
+    n_pixels = canvas_H * canvas_W
+    print(f"[GlobalRGB] Scatter {N:,} spots → ({canvas_H}×{canvas_W}) canvas...")
+    cnt = np.bincount(flat_idx, minlength=n_pixels).astype(np.float32)
+
+    rgb_float = np.zeros((n_pixels, 3), dtype=np.float32)
+    for ch in range(3):
+        rgb_float[:, ch] = np.bincount(flat_idx, weights=pca3[:, ch], minlength=n_pixels)
+
+    nonzero = cnt > 0
+    rgb_float[nonzero] /= cnt[nonzero, np.newaxis]
+
+    # per-channel 2~98 分位数归一化 → uint8；空像素填白色
+    rgb_out = np.full((n_pixels, 3), 255, dtype=np.uint8)
+    for ch in range(3):
+        vals = rgb_float[nonzero, ch]
+        lo = float(np.percentile(vals, 2))
+        hi = float(np.percentile(vals, 98))
+        denom = hi - lo if hi > lo else 1e-6
+        normed = np.clip((rgb_float[nonzero, ch] - lo) / denom, 0.0, 1.0)
+        rgb_out[nonzero, ch] = (normed * 255).astype(np.uint8)
+
+    coverage = nonzero.sum()
+    print(f"[GlobalRGB] Done — coverage {coverage:,}/{n_pixels:,} ({100*coverage/n_pixels:.1f}%)")
+    return rgb_out.reshape(canvas_H, canvas_W, 3)
+
+
 def assemble_st_rgb(input_dir: str, tiles: list[dict], canvas_H: int, canvas_W: int,
                     tile_size: int = 512) -> np.ndarray:
     """把所有 tile 的 ST_RGB PNG 拼成 canvas_H×canvas_W×3 uint8 图像。"""

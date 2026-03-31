@@ -26,6 +26,7 @@ from pydantic import BaseModel
 sys.path.insert(0, "/home/hmaixxz/condo/sam2")
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
 
 
 # ── Request / Response models ─────────────────────────────────────────────────
@@ -35,20 +36,25 @@ class SegmentRequest(BaseModel):
     boxes: list[list[float]] # [[x1, y1, x2, y2], ...] in pixel coords
 
 
+class SegmentAutoRequest(BaseModel):
+    image_b64: str           # base64-encoded PNG (H×W×3 uint8) — cropped region
+
+
 class SegmentResponse(BaseModel):
-    masks: list[str]   # base64-encoded uint8 flat arrays (0/1), one per box
+    masks: list[str]   # base64-encoded uint8 flat arrays (0/1), one per mask
     shape: list[int]   # [H, W] of the returned masks
 
 
 # ── Global predictor (loaded at startup) ─────────────────────────────────────
 
 app = FastAPI(title="SAM2 Segmentation Server")
-_predictor: SAM2ImagePredictor | None = None
+_predictor:    SAM2ImagePredictor        | None = None
+_auto_gen:     SAM2AutomaticMaskGenerator | None = None
 
 
 @app.on_event("startup")
 def _load_model():
-    global _predictor
+    global _predictor, _auto_gen
     args = _parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[SAM2 Server] Loading model on {device} ...")
@@ -56,6 +62,7 @@ def _load_model():
     print(f"  checkpoint: {args.checkpoint}")
     sam2_model = build_sam2(args.config, args.checkpoint, device=device)
     _predictor = SAM2ImagePredictor(sam2_model)
+    _auto_gen  = SAM2AutomaticMaskGenerator(sam2_model)
     print("[SAM2 Server] Model ready.")
 
 
@@ -98,6 +105,35 @@ def segment(req: SegmentRequest):
             mask_b64 = base64.b64encode(mask_hw.flatten().tobytes()).decode("ascii")
             masks_out.append(mask_b64)
 
+    return SegmentResponse(masks=masks_out, shape=[H, W])
+
+
+# ── Auto-segment endpoint ─────────────────────────────────────────────────────
+
+@app.post("/segment_auto", response_model=SegmentResponse)
+def segment_auto(req: SegmentAutoRequest):
+    if _auto_gen is None:
+        return JSONResponse(status_code=503, content={"detail": "Model not loaded"})
+
+    img_bytes = base64.b64decode(req.image_b64)
+    pil_img   = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+    img_np    = np.array(pil_img, dtype=np.uint8)
+
+    if img_np.ndim != 3 or img_np.shape[2] != 3:
+        return JSONResponse(status_code=400, content={"detail": "Expected H×W×3 RGB image"})
+
+    H, W = img_np.shape[:2]
+
+    with torch.inference_mode():
+        anns = _auto_gen.generate(img_np)   # list of dicts, each has 'segmentation' bool H×W
+
+    masks_out = []
+    for ann in anns:
+        mask_hw  = ann["segmentation"].astype(np.uint8)   # bool → 0/1 uint8
+        mask_b64 = base64.b64encode(mask_hw.flatten().tobytes()).decode("ascii")
+        masks_out.append(mask_b64)
+
+    print(f"[SAM2 Auto] {len(masks_out)} masks on {H}×{W} image")
     return SegmentResponse(masks=masks_out, shape=[H, W])
 
 

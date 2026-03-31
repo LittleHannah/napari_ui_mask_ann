@@ -71,6 +71,39 @@ class _SAM2Worker(QThread):
             self.error.emit(str(exc))
 
 
+class _SAM2AutoWorker(QThread):
+    """Sends a cropped image to /segment_auto (no box prompts) in a background thread."""
+    finished = Signal(list)   # list of np.ndarray bool H×W masks
+    error    = Signal(str)
+
+    def __init__(self, url: str, image_arr: np.ndarray):
+        super().__init__()
+        self._url       = url.rstrip("/") + "/segment_auto"
+        self._image_arr = image_arr   # H×W×3 uint8
+
+    def run(self):
+        try:
+            pil_img = PILImage.fromarray(self._image_arr)
+            buf     = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            resp = requests.post(self._url, json={"image_b64": img_b64}, timeout=300)
+            resp.raise_for_status()
+            data = resp.json()
+
+            H, W  = data["shape"]
+            masks = []
+            for m_b64 in data["masks"]:
+                raw = base64.b64decode(m_b64)
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape(H, W).astype(bool)
+                masks.append(arr)
+
+            self.finished.emit(masks)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 # ── Qt 样式表 ─────────────────────────────────────────────────────────────────
 PANEL_STYLE = """
 QWidget {
@@ -136,6 +169,9 @@ QPushButton#sam2RunBtn:disabled { background-color: #282828; color: #555; border
 QPushButton#sam2DrawBtn { color: #ffdd44; border-color: #7a6a1a; }
 QPushButton#sam2DrawBtn:hover { background-color: #3a3010; }
 QPushButton#sam2DrawActiveBtn { background-color: #3a3010; color: #ffee66; border-color: #aa9922; }
+QPushButton#sam2AutoBtn { color: #ffaa44; border-color: #7a5a1a; }
+QPushButton#sam2AutoBtn:hover { background-color: #3a2a10; }
+QPushButton#sam2AutoActiveBtn { background-color: #3a2a10; color: #ffcc66; border-color: #cc8822; }
 QLabel#sam2StatusLabel { color: #888888; font-size: 11px; padding: 2px 4px; font-style: italic; }
 
 QPushButton#doneBtn { color: #aaaaaa; border-color: #555; }
@@ -143,6 +179,8 @@ QPushButton#doneBtnActive { background-color: #1a3a5a; color: #55ddff; border-co
 
 QPushButton#fixSimBtn { color: #cccccc; border-color: #555; }
 QPushButton#fixSimActiveBtn { background-color: #3a1a5a; color: #cc88ff; border-color: #8844cc; font-weight: bold; }
+QPushButton#flipBtn { color: #cccccc; border-color: #555; }
+QPushButton#flipActiveBtn { background-color: #1a3a5a; color: #88ddff; border-color: #2288bb; font-weight: bold; }
 
 QPushButton#loadBtn { background-color: #1a3a5a; color: #88ccff; border-color: #336699; font-weight: bold; min-height: 28px; }
 QPushButton#loadBtn:hover { background-color: #2a4a6a; }
@@ -212,6 +250,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         "done_prefixes": set(),
         # similarity
         "sim_fixed": False,
+        # display flip (visual only, data unchanged)
+        "flip_h": False, "flip_v": False,
     }
 
     def _done_file() -> str:
@@ -259,14 +299,43 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         except Exception: sim.colormap = "viridis"
 
     def _world_to_label_rc(world_yx) -> tuple[int, int]:
-        """world 坐标 → label 数组 (row, col)，自动适应 lab.scale。"""
+        """world 坐标 → label 数组 (row, col)，自动适应 lab.scale 和 flip。"""
         wy, wx = float(world_yx[0]), float(world_yx[1])
         sy_l = float(lab.scale[0]) or 1.0
         sx_l = float(lab.scale[1]) or 1.0
         h, w = lab.data.shape[:2]
         r = int(np.clip(np.floor(wy / sy_l), 0, h - 1))
         c = int(np.clip(np.floor(wx / sx_l), 0, w - 1))
+        if state["flip_v"]: r = h - 1 - r
+        if state["flip_h"]: c = w - 1 - c
         return r, c
+
+    def _layer_affine(sy: float, sx: float, h: int, w: int) -> np.ndarray:
+        """计算 layer 的 data→world affine，融合 scale 和当前翻转状态。"""
+        a00 = -sy if state["flip_v"] else sy
+        a02 = sy * (h - 1) if state["flip_v"] else 0.0
+        a11 = -sx if state["flip_h"] else sx
+        a12 = sx * (w - 1) if state["flip_h"] else 0.0
+        return np.array([[a00, 0.0, a02], [0.0, a11, a12], [0.0, 0.0, 1.0]])
+
+    def _apply_flip_affines():
+        """把当前翻转状态以 affine 的形式施加到所有图层，数据本身不变。"""
+        if state["he_h"] is None:
+            return
+        he_h, he_w   = state["he_h"], state["he_w"]
+        st_h, st_w   = state["st_h"], state["st_w"]
+        emb_h, emb_w = state["emb_h"], state["emb_w"]
+        sy_st,  sx_st  = state["st_scale"]
+        sy_sim, sx_sim = state["sim_scale"]
+        sy_lab = float(lab.scale[0]); sx_lab = float(lab.scale[1])
+        lab_h, lab_w = lab.data.shape[:2]
+
+        he.affine          = _layer_affine(1.0,    1.0,    he_h,  he_w)
+        st.affine          = _layer_affine(sy_st,  sx_st,  st_h,  st_w)
+        sim.affine         = _layer_affine(sy_sim, sx_sim, emb_h, emb_w)
+        lab.affine         = _layer_affine(sy_lab, sx_lab, lab_h, lab_w)
+        lock_overlay.affine = _layer_affine(sy_lab, sx_lab, lab_h, lab_w)
+        query_cross.data   = []
 
     def _update_lock_overlay():
         """用黄色 RGBA 高亮所有被锁定的 instance 像素。"""
@@ -340,6 +409,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             r2 = int(np.clip(wy_max / sy, 0, img_h - 1))
             c1 = int(np.clip(wx_min / sx, 0, img_w - 1))
             c2 = int(np.clip(wx_max / sx, 0, img_w - 1))
+            if state["flip_v"]: r1, r2 = img_h - 1 - r2, img_h - 1 - r1
+            if state["flip_h"]: c1, c2 = img_w - 1 - c2, img_w - 1 - c1
             boxes_px.append([float(c1), float(r1), float(c2), float(r2)])
         return boxes_px
 
@@ -481,6 +552,7 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         state["prev_labels_snapshot"] = lab.data.copy()
 
         _update_lock_overlay()
+        _apply_flip_affines()
         _update_done_btn()
         print(f"[Load] {prefix} | HE={he_rgb.shape} ST={st_rgb.shape} EMB={emb_pca.shape} MASK={label_img.shape}")
 
@@ -529,6 +601,12 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     btn_fix_sim = QPushButton("📌 Fix Similarity Map")
     btn_fix_sim.setObjectName("fixSimBtn")
     sim_layout.addWidget(btn_fix_sim)
+
+    flip_row = QHBoxLayout();  flip_row.setSpacing(6)
+    btn_flip_h = QPushButton("⟺ Flip H");  btn_flip_h.setObjectName("flipBtn")
+    btn_flip_v = QPushButton("⇅ Flip V");  btn_flip_v.setObjectName("flipBtn")
+    flip_row.addWidget(btn_flip_h);  flip_row.addWidget(btn_flip_v)
+    sim_layout.addLayout(flip_row)
     sim_grp.setLayout(sim_layout)
 
     # ---- Mask group ----
@@ -596,11 +674,20 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     sam2_row2.addWidget(btn_sam2_clear)
     sam2_row2.addWidget(btn_sam2_run)
 
+    sam2_row3 = QHBoxLayout();  sam2_row3.setSpacing(6)
+    btn_sam2_auto  = QPushButton("🔲 Draw Region + Auto Seg")
+    btn_sam2_auto.setObjectName("sam2AutoBtn")
+    btn_sam2_auto_run = QPushButton("⚡ Auto Seg")
+    btn_sam2_auto_run.setObjectName("sam2RunBtn")
+    sam2_row3.addWidget(btn_sam2_auto, 2)
+    sam2_row3.addWidget(btn_sam2_auto_run, 1)
+
     lbl_sam2_status = QLabel("Draw boxes, then click Run SAM2")
     lbl_sam2_status.setObjectName("sam2StatusLabel")
 
     sam2_layout.addLayout(sam2_row1)
     sam2_layout.addLayout(sam2_row2)
+    sam2_layout.addLayout(sam2_row3)
     sam2_layout.addWidget(lbl_sam2_status)
     sam2_grp.setLayout(sam2_layout)
 
@@ -693,6 +780,25 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
             btn_fix_sim.setText("📌 Fix Similarity Map")
             btn_fix_sim.setObjectName("fixSimBtn")
         _refresh_btn_styles()
+
+    # -- Flip H / V --
+    def _toggle_flip_h():
+        state["flip_h"] = not state["flip_h"]
+        if state["flip_h"]:
+            btn_flip_h.setObjectName("flipActiveBtn")
+        else:
+            btn_flip_h.setObjectName("flipBtn")
+        _refresh_btn_styles()
+        _apply_flip_affines()
+
+    def _toggle_flip_v():
+        state["flip_v"] = not state["flip_v"]
+        if state["flip_v"]:
+            btn_flip_v.setObjectName("flipActiveBtn")
+        else:
+            btn_flip_v.setObjectName("flipBtn")
+        _refresh_btn_styles()
+        _apply_flip_affines()
 
     # -- Mask --
     def _add_instance():
@@ -893,6 +999,88 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
         worker.error.connect(_on_error)
         worker.start()
 
+    def _sam2_auto_toggle_draw():
+        """Toggle draw-region mode for auto-segmentation (reuses sam_boxes layer)."""
+        drawing = not state["sam2_drawing"]
+        state["sam2_drawing"] = drawing
+        if drawing:
+            sam_boxes.data = []   # clear previous boxes
+            sam_boxes.mode = "add_rectangle"
+            btn_sam2_auto.setText("◼ Stop Drawing")
+            btn_sam2_auto.setObjectName("sam2AutoActiveBtn")
+            lbl_sam2_status.setText("Draw ONE rectangle as the auto-seg region")
+        else:
+            sam_boxes.mode = "pan_zoom"
+            btn_sam2_auto.setText("🔲 Draw Region + Auto Seg")
+            btn_sam2_auto.setObjectName("sam2AutoBtn")
+            n = len(sam_boxes.data)
+            lbl_sam2_status.setText(f"Region ready ({n} box)" if n else "Draw region first")
+        _refresh_btn_styles()
+
+    def _sam2_auto_run():
+        if state["prefix"] is None:
+            lbl_sam2_status.setText("Load a prefix first"); return
+
+        layer_name = sam2_layer_cb.currentText()
+        url        = sam2_url_edit.text().strip()
+        if not url:
+            lbl_sam2_status.setText("Enter the server URL"); return
+
+        try:
+            img_arr, sy, sx = _get_layer_image_and_scale(layer_name)
+        except Exception as exc:
+            lbl_sam2_status.setText(f"Error: {exc}"); return
+
+        img_h, img_w = img_arr.shape[:2]
+
+        # If a box is drawn, crop to it; otherwise use full image
+        if len(sam_boxes.data) > 0:
+            boxes_px = _boxes_to_pixel_coords(layer_name)
+            all_x1 = int(min(b[0] for b in boxes_px))
+            all_y1 = int(min(b[1] for b in boxes_px))
+            all_x2 = int(max(b[2] for b in boxes_px))
+            all_y2 = int(max(b[3] for b in boxes_px))
+            crop_x1 = max(0, all_x1); crop_y1 = max(0, all_y1)
+            crop_x2 = min(img_w, all_x2); crop_y2 = min(img_h, all_y2)
+        else:
+            crop_x1, crop_y1, crop_x2, crop_y2 = 0, 0, img_w, img_h
+
+        crop_img = img_arr[crop_y1:crop_y2, crop_x1:crop_x2]
+        if crop_img.size == 0:
+            lbl_sam2_status.setText("Empty region"); return
+
+        state["sam2_crop"] = (crop_y1, crop_x1, sy, sx)
+        print(f"[SAM2 Auto] Crop {crop_img.shape[:2]}  origin=({crop_y1},{crop_x1})")
+
+        btn_sam2_auto_run.setEnabled(False)
+        btn_sam2_run.setEnabled(False)
+        lbl_sam2_status.setText(f"Running auto-seg on {layer_name} ({crop_img.shape[1]}×{crop_img.shape[0]}px)…")
+
+        if state["sam2_drawing"]:
+            _sam2_auto_toggle_draw()
+
+        worker = _SAM2AutoWorker(url, crop_img)
+        state["sam2_worker"] = worker
+
+        def _on_auto_done(masks_list):
+            _apply_sam2_results(masks_list)
+            btn_sam2_auto_run.setEnabled(True)
+            btn_sam2_run.setEnabled(True)
+            n = len(masks_list)
+            lbl_sam2_status.setText(f"Auto-seg done — {n} mask{'s' if n != 1 else ''} applied")
+            state["sam2_worker"] = None
+
+        def _on_auto_error(msg):
+            btn_sam2_auto_run.setEnabled(True)
+            btn_sam2_run.setEnabled(True)
+            lbl_sam2_status.setText(f"Error: {msg}")
+            print(f"[SAM2 Auto] Server error: {msg}")
+            state["sam2_worker"] = None
+
+        worker.finished.connect(_on_auto_done)
+        worker.error.connect(_on_auto_error)
+        worker.start()
+
     # -- Save --
     def _save_mask():
         if state["edited_mask_path"] is None:
@@ -957,6 +1145,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
 
     # ── 连接按钮 ─────────────────────────────────────────────────────────────
     btn_fix_sim.clicked.connect(_toggle_fix_sim)
+    btn_flip_h.clicked.connect(_toggle_flip_h)
+    btn_flip_v.clicked.connect(_toggle_flip_v)
     btn_add.clicked.connect(_add_instance)
     btn_del.clicked.connect(_delete_instance)
     btn_del_unlocked.clicked.connect(_delete_unlocked)
@@ -969,6 +1159,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
     btn_sam2_draw.clicked.connect(_sam2_toggle_draw)
     btn_sam2_clear.clicked.connect(_sam2_clear)
     btn_sam2_run.clicked.connect(_sam2_run)
+    btn_sam2_auto.clicked.connect(_sam2_auto_toggle_draw)
+    btn_sam2_auto_run.clicked.connect(_sam2_auto_run)
     btn_save.clicked.connect(_save_mask)
     btn_mark_done.clicked.connect(_mark_done)
     dataset_cb.currentTextChanged.connect(lambda _: _on_dataset_change())
@@ -1014,6 +1206,8 @@ def build_viewer(input_dir: str, initial_prefix: str | None = None):
                 yield;  return
             world_yx = event.position[:2]
             r, c = world_to_emb_rc(world_yx, state["sy"], state["sx"], state["emb_h"], state["emb_w"])
+            if state["flip_v"]: r = state["emb_h"] - 1 - r
+            if state["flip_h"]: c = state["emb_w"] - 1 - c
             state["last_query"].update({"r": r, "c": c, "world_yx": world_yx})
             _render_similarity(r, c, world_yx)
         yield
